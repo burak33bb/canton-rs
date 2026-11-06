@@ -2,10 +2,8 @@ use std::collections::BTreeMap;
 
 use canton::{
     ledger_api::{
-        grpc::v2::{
-            client::CantonClient,
-            retry::{CantonRetryPolicy, RetryConfig},
-        },
+        canton_base::retry::{CantonRetryPolicy, RetryConfig},
+        grpc::v2::LedgerApiClient,
         types::v2::{
             AcsDelta, AcsDeltaEvent, ArchivedEvent, ChoiceValue as _, Commands, Created,
             CreatedEvent, Event, EventFormat, TemplateValue as _, Transaction, TransactionFormat,
@@ -21,7 +19,7 @@ use my_contracts::{
 #[tokio::main]
 async fn main() {
     // Build client
-    let client = CantonClient::builder("http://localhost:9999")
+    let client = LedgerApiClient::builder("http://localhost:9999")
         .with_retry_config(RetryConfig::new().with_canton_policy(Some(CantonRetryPolicy::auto())))
         .connect_lazy()
         .unwrap();

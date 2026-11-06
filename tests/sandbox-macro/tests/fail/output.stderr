@@ -1,0 +1,15 @@
+error[E0277]: the trait bound `u32: Termination` is not satisfied
+ --> tests/fail/output.rs:1:1
+  |
+1 | #[sandbox::sandbox(fresh)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Termination` is not implemented for `u32`
+  |
+note: required by a bound in `sandbox::__private::run`
+ --> $WORKSPACE/tests/sandbox/src/__private.rs
+  |
+  | pub async fn run<T, F>(
+  |              --- required by a bound in this function
+...
+  |     T: Termination,
+  |        ^^^^^^^^^^^ required by this bound in `run`
+  = note: this error originates in the attribute macro `sandbox::sandbox` (in Nightly builds, run with -Z macro-backtrace for more info)

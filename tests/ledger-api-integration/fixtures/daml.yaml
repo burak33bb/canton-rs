@@ -1,0 +1,9 @@
+sdk-version: 3.6.2
+name: ledger-api-integration-fixtures
+version: 0.1.0
+source: daml
+dependencies:
+  - daml-prim
+  - daml-stdlib
+build-options:
+  - --target=${DAML_LF_TARGET}

@@ -1,6 +1,7 @@
 //! Simple wrapper for `dpm` to execute from build scripts.
 
 use std::{
+    collections::HashMap,
     env, error,
     ffi::OsStr,
     fmt,
@@ -38,7 +39,18 @@ impl fmt::Display for MultiPackage {
 
 #[derive(Clone, Debug)]
 pub struct BuildResult {
+    /// Path to the built DAR file.
     pub output: PathBuf,
+
+    /// `daml.yaml` file which was read during the build
+    ///
+    /// Note that it represents only the **content of the manifest file**, but not the actual values
+    /// used during build process. E.g. manifest file may have `sdk-version` set, but during build
+    /// it was overwritten by `DPM_SDK_VERSION`.
+    ///
+    /// If there were any issues with reading the manifest file, despite the build succeeded, this
+    /// will still be `None`.
+    pub manifest: Option<DamlYaml>,
 }
 
 struct ResolvedConfig {
@@ -46,13 +58,20 @@ struct ResolvedConfig {
     output: PathBuf,
     multi_package: MultiPackage,
     dpm_exe: PathBuf,
+    env: HashMap<String, String>,
 }
 
+/// Stripped (not full) representation of `daml.yaml`.
 #[derive(Clone, Debug, Deserialize)]
+#[non_exhaustive]
 pub struct DamlYaml {
     // We don't care about the rest of the fields now
-    #[serde(default)]
+    /// `source` field in `daml.yaml`
     pub source: Option<String>,
+
+    /// `sdk-version` field in `daml.yaml`
+    #[serde(rename = "sdk-version")]
+    pub sdk_version: Option<String>,
 }
 
 impl ResolvedConfig {
@@ -61,21 +80,38 @@ impl ResolvedConfig {
         // we put it under cargo::rerun-if-changed
         let daml_yaml_path = self.package_root.join("daml.yaml");
         println!("cargo::rerun-if-changed={}", daml_yaml_path.display());
-        if let Ok(file) = File::open(&daml_yaml_path) {
-            let source = yaml_serde::from_reader::<_, DamlYaml>(file)
-                .map(|daml_yaml| daml_yaml.source)
-                .ok()
-                .flatten();
-            if let Some(source) = source {
-                println!(
-                    "cargo::rerun-if-changed={}",
-                    self.package_root.join(source).display()
-                );
-            }
-        }
+        let manifest = if let Ok(file) = File::open(&daml_yaml_path) {
+            let manifest = yaml_serde::from_reader::<_, DamlYaml>(file)
+                .inspect_err(|error| {
+                    eprintln!(
+                        "warning: failed to read manifest file '{}': {error}",
+                        daml_yaml_path.display(),
+                    )
+                })
+                .ok();
+            manifest.inspect(|manifest| {
+                if let Some(source) = &manifest.source {
+                    println!(
+                        "cargo::rerun-if-changed={}",
+                        self.package_root.join(source).display()
+                    );
+                }
+            })
+        } else {
+            None
+        };
+
+        // These variables affect 'dpm build' behavior
+        println!("cargo::rerun-if-env-changed=DPM_SDK_VERSION");
+        println!("cargo::rerun-if-env-changed=DPM_MULTI_PACKAGE");
+        println!("cargo::rerun-if-env-changed=DPM_HOME");
+        println!("cargo::rerun-if-env-changed=DPM_EDITION");
+        println!("cargo::rerun-if-env-changed=DPM_ASSEMBLY");
+        println!("cargo::rerun-if-env-changed=DPM_LOCKFILE_ENABLED");
 
         let mut cmd = Command::new(&self.dpm_exe);
-        cmd.env("DAML_PACKAGE", &self.package_root)
+        cmd.envs(&self.env)
+            .env("DAML_PACKAGE", &self.package_root)
             .arg("build")
             .args(["--enable-multi-package", &self.multi_package.to_string()])
             .args([OsStr::new("--output"), self.output.as_os_str()]);
@@ -98,6 +134,7 @@ impl ResolvedConfig {
 
         Ok(BuildResult {
             output: self.output.clone(),
+            manifest,
         })
     }
 }
@@ -108,6 +145,7 @@ pub struct Config {
     output: Option<PathBuf>,
     multi_package: MultiPackage,
     dpm_exe: Option<PathBuf>,
+    env: HashMap<String, String>,
 }
 
 const DEFAULT_PACKAGE_NAME: &str = "package.dar";
@@ -133,12 +171,29 @@ impl Config {
         self
     }
 
+    /// Set `dpm` executable path.
+    ///
+    /// If `DPM` environment variable is set, it will take precedence over this setting.
+    /// If neither `dpm_exe()` nor `DPM` env var is specified, defaults to `dpm`, expecting it to be
+    /// available under `PATH`.
     pub fn dpm_exe(&mut self, path: impl AsRef<Path>) -> &mut Self {
         self.dpm_exe = Some(path.as_ref().to_path_buf());
         self
     }
 
+    /// Add an environment variable, which will be passed to `dpm` subprocess on launch.
+    ///
+    /// Specifying the same key twice overwrites the old value.
+    ///
+    /// Note that the builder always passes `DAML_PACKAGE` environment variable to `dpm` **after**
+    /// these variables, so setting it here does nothing. Use [`Config::package_root()`] instead.
+    pub fn env_var(&mut self, key: impl Into<String>, value: impl Into<String>) -> &mut Self {
+        self.env.insert(key.into(), value.into());
+        self
+    }
+
     fn resolve(&self) -> Result<ResolvedConfig, DpmError> {
+        println!("cargo::rerun-if-env-changed=DPM");
         let dpm_exe = if let Ok(dpm_exe) = env::var("DPM") {
             PathBuf::from(dpm_exe)
         } else if let Some(dpm_exe) = &self.dpm_exe {
@@ -166,6 +221,7 @@ impl Config {
             output,
             multi_package: self.multi_package,
             dpm_exe,
+            env: self.env.clone(),
         })
     }
 

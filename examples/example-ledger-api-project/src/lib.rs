@@ -1,9 +1,7 @@
 use canton::{
     ledger_api::{
-        grpc::v2::{
-            client::CantonClient,
-            retry::{CantonRetryPolicy, RetryConfig},
-        },
+        canton_base::retry::{CantonRetryPolicy, RetryConfig},
+        grpc::v2::LedgerApiClient,
         types::{
             v2::{
                 AcsDelta, ArchivedEvent, ChoiceValue, Commands, CreatedEvent, Event, EventFormat,
@@ -37,7 +35,7 @@ impl Choice<MyTemplate> for UpdateValue {
 }
 
 pub async fn example_workflow() {
-    let client = CantonClient::builder("http://localhost")
+    let client = LedgerApiClient::builder("http://localhost")
         .with_retry_config(RetryConfig::new().with_canton_policy(Some(CantonRetryPolicy::auto())))
         .connect_lazy()
         .unwrap();

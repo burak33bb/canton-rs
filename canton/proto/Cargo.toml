@@ -1,0 +1,35 @@
+[package]
+name = "canton-proto"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["std", "client", "transport"]
+
+# Enables tonic client generation
+client = ["std", "dep:tonic", "dep:tonic-prost", "admin-api-proto/client"]
+
+# Enables tonic server generation
+server = ["std", "dep:tonic", "dep:tonic-prost", "admin-api-proto/server"]
+
+transport = ["client", "tonic/channel", "admin-api-proto/transport"]
+
+# Enables std support
+std = ["prost/std", "prost-types/std", "admin-api-proto/std"]
+
+prost-types-chrono = [
+  "prost-types/chrono",
+  "admin-api-proto/prost-types-chrono",
+]
+
+[dependencies]
+admin-api-proto = { workspace = true }
+prost = { workspace = true, features = ["derive"] }
+prost-types.workspace = true
+tonic = { workspace = true, features = ["codegen"], optional = true }
+tonic-prost = { workspace = true, optional = true }
+
+[build-dependencies]
+glob.workspace = true
+tonic-prost-build = { workspace = true, features = ["transport"] }

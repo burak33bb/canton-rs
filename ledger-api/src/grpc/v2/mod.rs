@@ -1,9 +1,9 @@
 //! Ledger gRPC API
 
-pub mod auth;
 pub mod client;
 pub mod error;
-pub mod retry;
 pub mod services;
 #[cfg(feature = "tracing")]
 pub mod tracing_layer;
+
+pub use client::LedgerApiClient;

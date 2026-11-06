@@ -1,18 +1,25 @@
-use std::{mem, time::Duration};
+use std::{mem, sync::Arc, time::Duration};
 
+use canton_base::{
+    auth::interceptor::AuthInterceptor,
+    retry::{RetryConfig, RetryHandler},
+};
+use canton_version::semver::Version;
 use ledger_api_proto::com::daml::ledger::api::v2 as proto;
+use ledger_api_types::value::v2::errors::IntoValueError as _;
+use protobuf_utils::InvalidProtoField as _;
+use tokio::sync::RwLock;
 use tonic::transport::{Channel, Endpoint};
 
 use crate::grpc::v2::{
-    auth::AuthInterceptor,
-    error::ClientBuildError,
-    retry::{RetryConfig, RetryHandler},
+    error::{ClientBuildError, LedgerApiError, UnsupportedServerVersion},
     services::{
-        CommandServiceClient, PackageServiceClient, PartyManagementServiceClient,
+        ApiVersion, CommandServiceClient, PackageServiceClient, PartyManagementServiceClient,
         StateServiceClient, UpdateServiceClient, VersionServiceClient,
     },
 };
 
+#[cfg(feature = "_tls-any")]
 pub use tonic::transport::ClientTlsConfig;
 
 #[cfg(not(feature = "tracing"))]
@@ -23,22 +30,23 @@ type InnerChannel = crate::grpc::v2::tracing_layer::GrpcTracing<Channel>;
 pub(crate) type InterceptedService =
     tonic::service::interceptor::InterceptedService<InnerChannel, AuthInterceptor>;
 
-/// Builder for constructing a [`CantonClient`] with TLS and authentication.
+/// Builder for constructing a [`LedgerApiClient`] with TLS and authentication.
 ///
 /// # Example
 ///
 /// ```rust,no_run
 /// # async fn example() {
-/// # use ledger_api::grpc::v2::client::CantonClientBuilder;
-/// let client = CantonClientBuilder::new("https://localhost:5001")
+/// # use ledger_api::grpc::v2::client::LedgerApiClientBuilder;
+/// let client = LedgerApiClientBuilder::new("https://localhost:5001")
 ///     .with_token("my-jwt-token")
 ///     .connect()
 ///     .await
 ///     .unwrap();
 /// # }
 /// ```
-pub struct CantonClientBuilder {
+pub struct LedgerApiClientBuilder {
     endpoint: String,
+    #[cfg(feature = "_tls-any")]
     tls_config: Option<ClientTlsConfig>,
     token: Option<String>,
     max_decoding_message_size: Option<usize>,
@@ -47,19 +55,21 @@ pub struct CantonClientBuilder {
     keep_alive_timeout: Duration,
 }
 
-impl CantonClientBuilder {
+impl LedgerApiClientBuilder {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
+            #[cfg(feature = "_tls-any")]
             tls_config: None,
             token: None,
             max_decoding_message_size: None,
             retry_config: RetryConfig::default(),
-            http2_keep_alive_interval: CantonClient::DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL,
-            keep_alive_timeout: CantonClient::DEFAULT_KEEP_ALIVE_TIMEOUT,
+            http2_keep_alive_interval: LedgerApiClient::DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL,
+            keep_alive_timeout: LedgerApiClient::DEFAULT_KEEP_ALIVE_TIMEOUT,
         }
     }
 
+    #[cfg(feature = "_tls-any")]
     pub fn with_tls(mut self, config: ClientTlsConfig) -> Self {
         self.tls_config = Some(config);
         self
@@ -72,7 +82,7 @@ impl CantonClientBuilder {
 
     /// Max decoding message size will be set for all services returned by the client
     ///
-    /// If not set, defaults to [`CantonClient::DEFAULT_MAX_RECV_MESSAGE_SIZE`].
+    /// If not set, defaults to [`LedgerApiClient::DEFAULT_MAX_RECV_MESSAGE_SIZE`].
     pub fn with_max_decoding_message_size(mut self, size: usize) -> Self {
         self.max_decoding_message_size = Some(size);
         self
@@ -95,7 +105,7 @@ impl CantonClientBuilder {
     }
 
     /// Build the client, connected to the API
-    pub async fn connect(mut self) -> Result<CantonClient, ClientBuildError> {
+    pub async fn connect(mut self) -> Result<LedgerApiClient, ClientBuildError> {
         let endpoint = self.build_endpoint()?;
         let channel = endpoint.connect().await?;
 
@@ -110,27 +120,36 @@ impl CantonClientBuilder {
     /// This method uses lazy connection. The actual connection will be established on the first
     /// call to some RPC method.
     ///
-    /// If you want to establish connection immediately, use [`CantonClientBuilder::connect`].
-    pub fn connect_lazy(mut self) -> Result<CantonClient, ClientBuildError> {
+    /// If you want to establish connection immediately, use [`LedgerApiClientBuilder::connect`].
+    pub fn connect_lazy(mut self) -> Result<LedgerApiClient, ClientBuildError> {
         let endpoint = self.build_endpoint()?;
         let channel = endpoint.connect_lazy();
         Ok(self.build_client_with_channel(channel))
     }
 
     fn build_endpoint(&mut self) -> Result<Endpoint, ClientBuildError> {
-        let mut endpoint = Endpoint::from_shared(mem::take(&mut self.endpoint))?
+        let endpoint = Endpoint::from_shared(mem::take(&mut self.endpoint))?
             .http2_keep_alive_interval(self.http2_keep_alive_interval)
             .keep_alive_timeout(self.keep_alive_timeout)
             .keep_alive_while_idle(true);
 
-        if let Some(tls) = self.tls_config.take() {
-            endpoint = endpoint.tls_config(tls)?;
+        // We check this to prevent accidentally sending data in plaintext
+        #[cfg(not(feature = "_tls-any"))]
+        if endpoint.uri().scheme() == Some(&http::uri::Scheme::HTTPS) {
+            return Err(ClientBuildError::TlsNotSupported);
         }
+
+        #[cfg(feature = "_tls-any")]
+        let endpoint = if let Some(tls) = self.tls_config.take() {
+            endpoint.tls_config(tls)?
+        } else {
+            endpoint
+        };
 
         Ok(endpoint)
     }
 
-    fn build_client_with_channel(self, channel: Channel) -> CantonClient {
+    fn build_client_with_channel(self, channel: Channel) -> LedgerApiClient {
         #[cfg(feature = "tracing")]
         let channel = crate::grpc::v2::tracing_layer::GrpcTracing::new(channel);
 
@@ -138,27 +157,29 @@ impl CantonClientBuilder {
 
         let max_decoding_message_size = self
             .max_decoding_message_size
-            .unwrap_or(CantonClient::DEFAULT_MAX_RECV_MESSAGE_SIZE);
+            .unwrap_or(LedgerApiClient::DEFAULT_MAX_RECV_MESSAGE_SIZE);
 
-        CantonClient {
+        LedgerApiClient {
             channel,
             interceptor,
             max_decoding_message_size,
             retry_handler: self.retry_config.into_handler(),
+            server_caps: Arc::new(RwLock::new(None)),
         }
     }
 }
 
 /// A connected Canton Ledger API client.
 #[derive(Clone)]
-pub struct CantonClient {
+pub struct LedgerApiClient {
     channel: InnerChannel,
     interceptor: AuthInterceptor,
     max_decoding_message_size: usize,
     retry_handler: RetryHandler,
+    server_caps: Arc<RwLock<Option<ApiVersion>>>,
 }
 
-impl CantonClient {
+impl LedgerApiClient {
     /// 128 MiB (default for Canton client, used in original Scala client code)
     pub const DEFAULT_MAX_RECV_MESSAGE_SIZE: usize = 0x8000000;
 
@@ -170,8 +191,8 @@ impl CantonClient {
     pub const DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(20);
     pub const DEFAULT_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
-    pub fn builder(endpoint: impl Into<String>) -> CantonClientBuilder {
-        CantonClientBuilder::new(endpoint)
+    pub fn builder(endpoint: impl Into<String>) -> LedgerApiClientBuilder {
+        LedgerApiClientBuilder::new(endpoint)
     }
 
     /// Set a new retry configuration for the client
@@ -186,6 +207,73 @@ impl CantonClient {
     /// Reference to the retry configuration of the client
     pub fn retry_config(&self) -> &RetryConfig {
         self.retry_handler.config()
+    }
+
+    /// Resolved server capabilities, cached in the client (if some).
+    pub async fn server_caps(&self) -> Option<ApiVersion> {
+        self.server_caps.read().await.clone()
+    }
+
+    /// Resolve server version and enabled features through [`VersionServiceClient`] and cache these
+    /// results inside the client.
+    ///
+    /// An error will be returned, if the server version is not compatible with client version
+    /// (see [`supported_versions()`][crate::supported_versions()]). Note that cached value will
+    /// be nullified for all copies of the client in this case.
+    ///
+    /// Cached results are shared among all copies of the client. This function can be called again
+    /// to update the cached values for all existing copies of the client.
+    ///
+    /// By default, if the version wasn't resolved, client treats server as compatible.
+    ///
+    /// Note that during client lifetime the server may change its capabilities (e.g. it may be
+    /// upgraded to a newer version). The client cannot detect these situations automatically,
+    /// because the underlying channel could be silently re-created. Given that, in your application
+    /// it might be a good idea to run this resolution periodically, thus making error messages more
+    /// precise.
+    pub async fn resolve_server_capabilities(&self) -> Result<(), LedgerApiError> {
+        // We use a raw service without a wrapper to decode the features descriptor based on the
+        // supported version. VersionServiceClient wrapper doesn't allow that.
+        let version_service =
+            proto::version_service_client::VersionServiceClient::with_interceptor(
+                self.channel.clone(),
+                self.interceptor.clone(),
+            )
+            .max_decoding_message_size(self.max_decoding_message_size);
+
+        let response = self
+            .retry_handler
+            .call(&version_service, &(), |mut svc, _| async move {
+                svc.get_ledger_api_version(proto::GetLedgerApiVersionRequest {})
+                    .await
+                    .map_err(LedgerApiError::from_status)
+            })
+            .await?;
+
+        let server_version = Version::parse(&response.version)
+            .validated_of::<proto::GetLedgerApiVersionResponse>("version")
+            .with_msg("expected a SemVer-compatible version")?;
+        let supported = crate::is_supported_version(&server_version);
+
+        #[cfg(feature = "tracing")]
+        tracing::debug!(%server_version, supported, "Resolved server version");
+
+        if supported {
+            // We should be able to decode features descriptor in this case
+            let api_version = ApiVersion::try_from(response)?;
+
+            #[cfg(feature = "tracing")]
+            tracing::debug!(features = ?api_version.features, "Resolved Ledger API features");
+
+            let mut server_caps = self.server_caps.write().await;
+            *server_caps = Some(api_version);
+
+            Ok(())
+        } else {
+            let mut server_caps = self.server_caps.write().await;
+            *server_caps = None;
+            Err(UnsupportedServerVersion::new(server_version).into())
+        }
     }
 
     pub fn command(&self) -> CommandServiceClient {
